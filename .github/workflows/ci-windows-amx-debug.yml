@@ -22,6 +22,10 @@ name: "CI CPU Windows AMX Debug"
 # capabilities (CPUID + XCR0, parsed + a guarded AMX execution probe) before the
 # build, and enables oneDNN verbose logging during tests.
 on:
+  push:
+    branches: [rahul-ci-windows-2025]
+  pull_request:
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
 
 concurrency:
