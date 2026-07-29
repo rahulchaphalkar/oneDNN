@@ -1,0 +1,93 @@
+# *******************************************************************************
+# Copyright 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# *******************************************************************************
+
+name: "CI CPU Windows AMX Debug"
+
+# Standalone, on-demand diagnostic workflow. It mirrors the regular Windows CPU
+# build/test job but runs on the windows-2025 image, prints the CPU's AMX/BF16
+# capabilities (CPUID + XCR0, parsed + a guarded AMX execution probe) before the
+# build, and enables oneDNN verbose logging during tests.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: read-all
+
+jobs:
+  build-test-windows-amx-debug:
+    name: Windows x64 AMX Debug
+    runs-on: windows-2025
+    steps:
+      - name: Checkout oneDNN
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          path: oneDNN
+
+      - name: Get latest CMake and Ninja
+        uses: lukka/get-cmake@56d043d188c3612951d8755da8f4b709ec951ad6 # v3.31.6
+        with:
+          cmakeVersion: 3.31.0
+          ninjaVersion: 1.12.0
+
+      - name: CPU ISA diagnostic (AMX / BF16)
+        working-directory: ${{ github.workspace }}/oneDNN
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do set "VSPATH=%%i"
+          call "%VSPATH%\Common7\Tools\VsDevCmd.bat" -arch=x64
+          cl /nologo /EHa /O2 /Fe:cpu_isa_check.exe .github\automation\x64\cpu_isa_check.cpp
+          if errorlevel 1 exit /b 1
+          cpu_isa_check.exe
+
+      - name: Install LLVM
+        uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0 # v2.0.9
+        with:
+          version: 19.1.7
+          directory: ${{ runner.temp }}\llvm
+
+      - name: Setup ccache
+        uses: Chocobo1/setup-ccache-action@f433cb1e0b3ed576864d7fc361ce43b23b181e67 # v1.5.4
+        with:
+          windows_compile_environment: msvc
+          remove_stale_cache: false
+          ccache_options: |
+            max_size=750M
+
+      - name: Build oneDNN
+        working-directory: ${{ github.workspace }}/oneDNN
+        shell: cmd
+        env:
+          CCACHE_BASEDIR: ${{ github.workspace }}\oneDNN
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do set "VSPATH=%%i"
+          call "%VSPATH%\Common7\Tools\VsDevCmd.bat" -arch=x64
+          set "PATH=%LLVM_PATH%\bin;%PATH%"
+          where clang
+          clang --version
+          .github\azure\build.bat /THREADING omp /MODE Release /SOURCEDIR %CD% /BUILDDIR %CD%\build /CMAKEOPT "-G Ninja -DCMAKE_PREFIX_PATH=%LLVM_PATH% -DCMAKE_C_COMPILER=%LLVM_PATH%\bin\clang.exe -DCMAKE_CXX_COMPILER=%LLVM_PATH%\bin\clang++.exe -DCMAKE_C_COMPILER_LAUNCHER:FILEPATH=${{ env.ccache_symlinks_path }} -DCMAKE_CXX_COMPILER_LAUNCHER:FILEPATH=${{ env.ccache_symlinks_path }} -DOpenMP_C_FLAGS=-fopenmp=libomp -DOpenMP_CXX_FLAGS=-fopenmp=libomp -DOpenMP_C_LIB_NAMES=libomp -DOpenMP_CXX_LIB_NAMES=libomp -DOpenMP_libomp_LIBRARY=%LLVM_PATH%\lib\libomp.lib -DOpenMP_C_SPEC_DATE=201811 -DOpenMP_CXX_SPEC_DATE=201811 -DONEDNN_BUILD_GRAPH=OFF"
+
+      - name: Run oneDNN tests
+        working-directory: ${{ github.workspace }}/oneDNN
+        shell: cmd
+        env:
+          ONEDNN_VERBOSE: 1
+          ONEDNN_SKIP_TESTS_REGEX: test_iface_attr|test_pooling_forward|test_benchdnn_modeC_concat_smoke_cpu|test_benchdnn_modeC_conv_smoke_cpu|test_benchdnn_modeC_deconv_smoke_cpu|test_benchdnn_modeC_pool_smoke_cpu|test_benchdnn_modeC_reorder_smoke_cpu|cpu-tutorials-matmul-sgemm-and-matmul-cpp|cpu-tutorials-matmul-weights-decompression-matmul-cpp|test_iface_sparse
+        run: .github\azure\test.bat /BUILDDIR %CD%\build /MODE Release /REPORTDIR %CD%\report
