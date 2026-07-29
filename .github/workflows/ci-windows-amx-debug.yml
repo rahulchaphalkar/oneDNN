@@ -86,12 +86,18 @@ jobs:
           set "PATH=%LLVM_PATH%\bin;%PATH%"
           where clang
           clang --version
-          .github\azure\build.bat /THREADING omp /MODE Release /SOURCEDIR %CD% /BUILDDIR %CD%\build /CMAKEOPT "-G Ninja -DCMAKE_PREFIX_PATH=%LLVM_PATH% -DCMAKE_C_COMPILER=%LLVM_PATH%\bin\clang.exe -DCMAKE_CXX_COMPILER=%LLVM_PATH%\bin\clang++.exe -DCMAKE_C_COMPILER_LAUNCHER:FILEPATH=${{ env.ccache_symlinks_path }} -DCMAKE_CXX_COMPILER_LAUNCHER:FILEPATH=${{ env.ccache_symlinks_path }} -DOpenMP_C_FLAGS=-fopenmp=libomp -DOpenMP_CXX_FLAGS=-fopenmp=libomp -DOpenMP_C_LIB_NAMES=libomp -DOpenMP_CXX_LIB_NAMES=libomp -DOpenMP_libomp_LIBRARY=%LLVM_PATH%\lib\libomp.lib -DOpenMP_C_SPEC_DATE=201811 -DOpenMP_CXX_SPEC_DATE=201811 -DONEDNN_BUILD_GRAPH=OFF"
+          cmake ./CMakeLists.txt -B%CD%\build -DCMAKE_BUILD_TYPE=Release -DDNNL_BUILD_FOR_CI=ON -DDNNL_WERROR=ON -DDNNL_CPU_RUNTIME=OMP -DDNNL_GPU_RUNTIME=NONE -DDNNL_TEST_SET=SMOKE -DDNNL_BUILD_EXAMPLES=OFF -DONEDNN_BUILD_GRAPH=OFF -G Ninja -DCMAKE_PREFIX_PATH=%LLVM_PATH% -DCMAKE_C_COMPILER=%LLVM_PATH%\bin\clang.exe -DCMAKE_CXX_COMPILER=%LLVM_PATH%\bin\clang++.exe -DCMAKE_C_COMPILER_LAUNCHER:FILEPATH=${{ env.ccache_symlinks_path }} -DCMAKE_CXX_COMPILER_LAUNCHER:FILEPATH=${{ env.ccache_symlinks_path }} -DOpenMP_C_FLAGS=-fopenmp=libomp -DOpenMP_CXX_FLAGS=-fopenmp=libomp -DOpenMP_C_LIB_NAMES=libomp -DOpenMP_CXX_LIB_NAMES=libomp -DOpenMP_libomp_LIBRARY=%LLVM_PATH%\lib\libomp.lib -DOpenMP_C_SPEC_DATE=201811 -DOpenMP_CXX_SPEC_DATE=201811
+          if errorlevel 1 exit /b 1
+          rem Build only the library plus the targets needed for the AMX bf16 tests.
+          cmake --build %CD%\build --parallel --target dnnl test_internals benchdnn
+          if errorlevel 1 exit /b 1
 
       - name: Run oneDNN tests
         working-directory: ${{ github.workspace }}/oneDNN
         shell: cmd
         env:
           ONEDNN_VERBOSE: 1
-          ONEDNN_SKIP_TESTS_REGEX: test_iface_attr|test_pooling_forward|test_benchdnn_modeC_concat_smoke_cpu|test_benchdnn_modeC_conv_smoke_cpu|test_benchdnn_modeC_deconv_smoke_cpu|test_benchdnn_modeC_pool_smoke_cpu|test_benchdnn_modeC_reorder_smoke_cpu|cpu-tutorials-matmul-sgemm-and-matmul-cpp|cpu-tutorials-matmul-weights-decompression-matmul-cpp|test_iface_sparse
-        run: .github\azure\test.bat /BUILDDIR %CD%\build /MODE Release /REPORTDIR %CD%\report
+        run: |
+          set "PATH=%LLVM_PATH%\bin;%CD%\build\src;%PATH%"
+          cd %CD%\build
+          ctest --output-on-failure -R "test_internals|test_benchdnn_modeC_conv_smoke_cpu|test_benchdnn_modeC_matmul_smoke_cpu"
