@@ -247,6 +247,8 @@ int main() {
     const cpuid_regs_t leaf1 = cpuid(0x1u, 0);
     const cpuid_regs_t leaf7_0 = cpuid(0x7u, 0);
     const cpuid_regs_t leaf7_1 = cpuid(0x7u, 1);
+    const cpuid_regs_t leaf1d_0 = cpuid(0x1Du, 0);
+    const cpuid_regs_t leaf1d_1 = cpuid(0x1Du, 1);
 
     // OSXSAVE (CPUID.1:ECX[27]) tells us XGETBV is usable.
     const bool osxsave = bit(leaf1.ecx, 27);
@@ -259,6 +261,10 @@ int main() {
     printf("CPUID.7.0:ECX  = 0x%08X\n", leaf7_0.ecx);
     printf("CPUID.7.0:EDX  = 0x%08X\n", leaf7_0.edx);
     printf("CPUID.7.1:EAX  = 0x%08X\n", leaf7_1.eax);
+        printf("CPUID.1D.0:EAX = 0x%08X (max AMX palette ID)\n", leaf1d_0.eax);
+        printf("CPUID.1D.1:EBX = 0x%08X (palette 1 tiles/colsb)\n",
+            leaf1d_1.ebx);
+        printf("CPUID.1D.1:ECX = 0x%08X (palette 1 rows)\n", leaf1d_1.ecx);
     printf("XCR0           = 0x%016llX\n", static_cast<unsigned long long>(xcr0));
 
     // --- Parsed feature bits --------------------------------------------------
@@ -274,6 +280,10 @@ int main() {
     const bool amx_int8 = bit(leaf7_0.edx, 25);
     const bool xtilecfg = bit(static_cast<unsigned int>(xcr0), 17);
     const bool xtiledata = bit(static_cast<unsigned int>(xcr0), 18);
+    const unsigned int max_palette = leaf1d_0.eax;
+    const unsigned int palette1_max_tiles = leaf1d_1.ebx >> 16;
+    const unsigned int palette1_max_colsb = leaf1d_1.ebx & 0xFFFFu;
+    const unsigned int palette1_max_rows = leaf1d_1.ecx & 0xFFFFu;
 
     printf("\n-- Parsed capabilities --------------------------------------------\n");
     printf("OSXSAVE            : %s\n", yn(osxsave));
@@ -289,6 +299,9 @@ int main() {
     printf("AMX_INT8           : %s\n", yn(amx_int8));
     printf("XCR0.XTILECFG (17) : %s\n", yn(xtilecfg));
     printf("XCR0.XTILEDATA(18) : %s\n", yn(xtiledata));
+        printf("AMX max palette ID : %u\n", max_palette);
+        printf("AMX palette 1      : tiles=%u colsb=%u rows=%u\n",
+            palette1_max_tiles, palette1_max_colsb, palette1_max_rows);
 
     // --- Derived verdicts (mirror oneDNN mayiuse() logic) ---------------------
     const bool bf16_usable = avx512f && avx512dq && avx512bw && avx512vl
@@ -302,6 +315,14 @@ int main() {
     printf("AVX512 BF16 usable (avx512_core_bf16) : %s\n", yn(bf16_usable));
     printf("oneDNN would enable AMX (amx_tile)    : %s\n", yn(amx_selected));
     printf("oneDNN would enable AMX BF16          : %s\n", yn(amx_bf16_selected));
+    printf("oneDNN AMX target palette             : %u\n",
+            max_palette >= 1 ? 1u : 0u);
+    if (amx_selected && max_palette == 0) {
+        printf("WARNING: inconsistent AMX enumeration: AMX_TILE + XCR0 are "
+               "enabled, but CPUID.1D reports no palette. oneDNN will load "
+               "palette 0 (INIT state), so subsequent tile data/compute "
+               "instructions can raise #UD.\n");
+    }
 
     // --- Guarded AMX execution probe ------------------------------------------
     printf("\n-- AMX execution probe (guarded, staged) --------------------------\n");
