@@ -45,6 +45,15 @@ cd "${REPO_ROOT}"
 BUILD_DIR="${1:-${BUILD_DIR:-build-amx-debug}}"
 JOBS="${JOBS:-$(nproc)}"
 
+# Pick a CMake generator: prefer Ninja if available, else Unix Makefiles.
+if [[ -z "${GENERATOR:-}" ]]; then
+    if command -v ninja >/dev/null 2>&1; then
+        GENERATOR="Ninja"
+    else
+        GENERATOR="Unix Makefiles"
+    fi
+fi
+
 # Pick compilers: prefer clang to match the Windows job, fall back to gcc.
 if [[ -z "${CC:-}" || -z "${CXX:-}" ]]; then
     if command -v clang >/dev/null 2>&1 && command -v clang++ >/dev/null 2>&1; then
@@ -62,6 +71,7 @@ echo " oneDNN local AMX debug run (Linux)"
 echo "=================================================================="
 echo "Repo root  : ${REPO_ROOT}"
 echo "Build dir  : ${BUILD_DIR}"
+echo "Generator  : ${GENERATOR}"
 echo "Compilers  : CC=${CC} CXX=${CXX}"
 echo "Jobs       : ${JOBS}"
 echo "MAX_CPU_ISA: ${ONEDNN_MAX_CPU_ISA:-<unset>}"
@@ -81,7 +91,7 @@ echo
 echo "------------------------------------------------------------------"
 echo " Step 2: Configure & build (dnnl test_internals benchdnn)"
 echo "------------------------------------------------------------------"
-cmake -S "${REPO_ROOT}" -B "${BUILD_DIR}" -G Ninja \
+cmake -S "${REPO_ROOT}" -B "${BUILD_DIR}" -G "${GENERATOR}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DDNNL_BUILD_FOR_CI=ON \
     -DDNNL_WERROR=ON \
