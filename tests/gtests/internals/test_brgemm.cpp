@@ -46,8 +46,19 @@ struct brgemm_params_t : test_params_t {
 namespace {
 
 bool brgemm_amx_trace_enabled() {
+#ifdef _WIN32
+    char *value = nullptr;
+    size_t value_size = 0;
+    const errno_t status = _dupenv_s(
+            &value, &value_size, "ONEDNN_TEST_BRGEMM_AMX_TRACE");
+    const bool enabled = status == 0 && value != nullptr && value[0] != '\0'
+            && value[0] != '0';
+    std::free(value);
+    return enabled;
+#else
     const char *value = std::getenv("ONEDNN_TEST_BRGEMM_AMX_TRACE");
     return value != nullptr && value[0] != '\0' && value[0] != '0';
+#endif
 }
 
 const char *data_type_name(impl::data_type_t dt) {
@@ -58,6 +69,28 @@ const char *data_type_name(impl::data_type_t dt) {
         case f16: return "f16";
         case s8: return "s8";
         case u8: return "u8";
+        default: return "other";
+    }
+}
+
+const char *isa_name(impl::cpu::x64::cpu_isa_t isa) {
+    using namespace impl::cpu::x64;
+    switch (isa) {
+        case avx10_2_512_amx_2: return "avx10_2_512_amx_2";
+        case avx10_2_512: return "avx10_2_512";
+        case avx512_core_amx_fp16: return "avx512_core_amx_fp16";
+        case avx512_core_amx: return "avx512_core_amx";
+        case avx512_core_fp16: return "avx512_core_fp16";
+        case avx512_core_bf16_ymm: return "avx512_core_bf16_ymm";
+        case avx512_core_bf16: return "avx512_core_bf16";
+        case avx512_core_vnni: return "avx512_core_vnni";
+        case avx512_core: return "avx512_core";
+        case avx2_vnni_2: return "avx2_vnni_2";
+        case avx2_vnni: return "avx2_vnni";
+        case avx2: return "avx2";
+        case avx: return "avx";
+        case sse41: return "sse41";
+        case isa_undef: return "isa_undef";
         default: return "other";
     }
 }
@@ -76,7 +109,7 @@ void trace_brgemm_amx(const char *stage, const brgemm_params_t &p,
             static_cast<long long>(p.K), static_cast<long long>(p.lda),
             static_cast<long long>(p.ldb), static_cast<long long>(p.ldc),
             data_type_name(p.dt_a), data_type_name(p.dt_b), p.alpha, p.beta,
-            impl::cpu::x64::isa2str(desc.isa_impl).c_str(), desc.is_tmm ? 1 : 0,
+            isa_name(desc.isa_impl), desc.is_tmm ? 1 : 0,
             desc.bd_block, desc.bdb_tail, desc.ld_block, desc.ldb_tail,
             desc.rd_block, desc.rdb_tail, desc.rd_step);
 
