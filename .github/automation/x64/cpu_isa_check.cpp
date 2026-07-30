@@ -110,20 +110,109 @@ void print_microarch() {
             display_model, microarch_name(display_family, display_model));
 }
 
-// Guarded AMX execution probe. Attempts to execute a real tile instruction.
-// Returns 1 = executed OK, 0 = raised an exception (e.g. #UD / illegal instr).
-int probe_amx_execution() {
+// AMX tile configuration structure (palette 1): 64-byte layout expected by
+// LDTILECFG. Mirrors the layout oneDNN builds in brgemm_init_tiles.
+struct amx_tilecfg_t {
+    uint8_t palette_id;
+    uint8_t start_row;
+    uint8_t reserved[14];
+    uint16_t colsb[16];
+    uint8_t rows[16];
+};
+
+// Result of the staged AMX execution probe: identifies exactly how far the
+// tile pipeline got before faulting (if at all).
+enum class amx_probe_stage_t {
+    ok, // full ldtilecfg + tileloadd + tdpbf16ps executed
+    release_faulted, // even TILERELEASE (no config/data) raised #UD
+    ldtilecfg_faulted, // tile *configuration* raised #UD
+    tileload_dpbf16_faulted, // tile *data*/compute raised #UD
+};
+
+// Level 1 probe: TILERELEASE only. Needs no tile config or data - the cheapest
+// possible tile instruction. Passing this does NOT prove the data/compute path
+// works (some VMs enable config-level ops but not XTILEDATA-backed ops).
+bool probe_tilerelease() {
     __try {
-        // TILERELEASE is a benign AMX tile instruction: it resets tile state
-        // and requires no configuration. If AMX is genuinely usable this is a
-        // no-op; if the host cannot execute tile ops it raises #UD.
         _tile_release();
-        return 1;
+        return true;
     } __except (GetExceptionCode() == static_cast<DWORD>(STATUS_ILLEGAL_INSTRUCTION)
                     ? EXCEPTION_EXECUTE_HANDLER
                     : EXCEPTION_CONTINUE_SEARCH) {
-        return 0;
+        return false;
     }
+}
+
+// Level 2 probe: LDTILECFG with a valid palette-1 configuration. Exercises the
+// tile *configuration* path but not tile data loads or the multiply.
+bool probe_ldtilecfg(const amx_tilecfg_t *cfg) {
+    __try {
+        _tile_loadconfig(cfg);
+        _tile_release();
+        return true;
+    } __except (GetExceptionCode() == static_cast<DWORD>(STATUS_ILLEGAL_INSTRUCTION)
+                    ? EXCEPTION_EXECUTE_HANDLER
+                    : EXCEPTION_CONTINUE_SEARCH) {
+        return false;
+    }
+}
+
+// Level 3 probe: full path - LDTILECFG + TILELOADD (loads tile *data*, needs
+// XTILEDATA to be genuinely backed by the OS/hypervisor) + TDPBF16PS (the
+// bf16 tile multiply, exactly what oneDNN's matmul/conv kernels run). This is
+// the sequence that faults on VMs with only partial AMX enablement.
+bool probe_tdpbf16ps(const amx_tilecfg_t *cfg, const uint16_t *a,
+        const uint16_t *b, float *c, int stride) {
+    __try {
+        _tile_loadconfig(cfg);
+        _tile_loadd(0, a, stride); // tmm0 = A
+        _tile_loadd(1, b, stride); // tmm1 = B
+        _tile_loadd(2, c, stride); // tmm2 = C (accumulator)
+        _tile_dpbf16ps(2, 0, 1); // tmm2 += tmm0 * tmm1  (bf16)
+        _tile_stored(2, c, stride);
+        _tile_release();
+        return true;
+    } __except (GetExceptionCode() == static_cast<DWORD>(STATUS_ILLEGAL_INSTRUCTION)
+                    ? EXCEPTION_EXECUTE_HANDLER
+                    : EXCEPTION_CONTINUE_SEARCH) {
+        return false;
+    }
+}
+
+// Staged AMX execution probe. Runs progressively heavier tile operations and
+// reports the first stage that faults, so a VM that enables config-level tile
+// ops but not XTILEDATA-backed data/compute ops (the windows-2025 case) is
+// distinguished from one where AMX is entirely unusable.
+amx_probe_stage_t probe_amx_execution() {
+    if (!probe_tilerelease()) return amx_probe_stage_t::release_faulted;
+
+    // Consistent palette-1 config: M=16, N=16, K=32 bf16.
+    // A: rows=16, colsb=64 (32 bf16 = K).  B: rows=16, colsb=64 (pre-packed,
+    // N*4).  C: rows=16, colsb=64 (N*4 f32).  All tiles uniformly 16x64.
+    amx_tilecfg_t cfg;
+    std::memset(&cfg, 0, sizeof(cfg));
+    cfg.palette_id = 1;
+    for (int t = 0; t < 3; ++t) {
+        cfg.rows[t] = 16;
+        cfg.colsb[t] = 64;
+    }
+
+    if (!probe_ldtilecfg(&cfg)) return amx_probe_stage_t::ldtilecfg_faulted;
+
+    // Tile data buffers. 16 rows * 64 bytes = 1024 bytes each.
+    alignas(64) uint16_t a[16 * 32];
+    alignas(64) uint16_t b[16 * 32];
+    alignas(64) float c[16 * 16];
+    for (int i = 0; i < 16 * 32; ++i) {
+        a[i] = 0x3F80; // bf16(1.0)
+        b[i] = 0x3F80; // bf16(1.0)
+    }
+    std::memset(c, 0, sizeof(c));
+
+    if (!probe_tdpbf16ps(&cfg, a, b, c, 64))
+        return amx_probe_stage_t::tileload_dpbf16_faulted;
+
+    return amx_probe_stage_t::ok;
 }
 
 } // namespace
@@ -197,16 +286,29 @@ int main() {
     printf("oneDNN would enable AMX BF16          : %s\n", yn(amx_bf16_selected));
 
     // --- Guarded AMX execution probe ------------------------------------------
-    printf("\n-- AMX execution probe (guarded) ----------------------------------\n");
+    printf("\n-- AMX execution probe (guarded, staged) --------------------------\n");
     if (!amx_selected) {
         printf("AMX EXECUTION      : SKIPPED (AMX not advertised/enabled)\n");
     } else {
-        const int ok = probe_amx_execution();
-        if (ok) {
-            printf("AMX EXECUTION      : OK (tile instruction executed)\n");
-        } else {
-            printf("AMX EXECUTION      : FAULTED (#UD) - AMX advertised but not "
-                   "executable on this host\n");
+        const amx_probe_stage_t stage = probe_amx_execution();
+        switch (stage) {
+            case amx_probe_stage_t::ok:
+                printf("AMX EXECUTION      : OK (ldtilecfg + tileloadd + "
+                       "tdpbf16ps all executed)\n");
+                break;
+            case amx_probe_stage_t::release_faulted:
+                printf("AMX EXECUTION      : FAULTED (#UD) at TILERELEASE - no "
+                       "tile ops usable on this host\n");
+                break;
+            case amx_probe_stage_t::ldtilecfg_faulted:
+                printf("AMX EXECUTION      : FAULTED (#UD) at LDTILECFG - tile "
+                       "configuration not usable on this host\n");
+                break;
+            case amx_probe_stage_t::tileload_dpbf16_faulted:
+                printf("AMX EXECUTION      : FAULTED (#UD) at TILELOADD/TDPBF16PS "
+                       "- config OK but XTILEDATA-backed data/compute NOT usable "
+                       "(partial AMX enablement, e.g. under virtualization)\n");
+                break;
         }
     }
 

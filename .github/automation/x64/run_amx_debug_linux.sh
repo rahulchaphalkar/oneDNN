@@ -83,7 +83,15 @@ echo " Step 1: CPU ISA diagnostic (AMX / BF16)"
 echo "------------------------------------------------------------------"
 DIAG_SRC="${SCRIPT_DIR}/cpu_isa_check_linux.cpp"
 DIAG_BIN="$(mktemp -d)/cpu_isa_check_linux"
-"${CXX}" -O2 -std=c++17 -o "${DIAG_BIN}" "${DIAG_SRC}"
+# Compile with AMX intrinsics enabled so the probe can exercise the full
+# ldtilecfg + tileloadd + tdpbf16ps path (all runtime-guarded against #UD).
+# Fall back to a TILERELEASE-only probe if the compiler lacks AMX support.
+if "${CXX}" -O2 -std=c++17 -mamx-tile -mamx-bf16 -o "${DIAG_BIN}" "${DIAG_SRC}" 2>/dev/null; then
+    :
+else
+    echo "note: compiler lacks -mamx-tile/-mamx-bf16; building TILERELEASE-only probe"
+    "${CXX}" -O2 -std=c++17 -o "${DIAG_BIN}" "${DIAG_SRC}"
+fi
 "${DIAG_BIN}" || true
 echo
 
@@ -104,7 +112,8 @@ cmake -S "${REPO_ROOT}" -B "${BUILD_DIR}" -G "${GENERATOR}" \
     -DCMAKE_CXX_COMPILER="${CXX}"
 
 cmake --build "${BUILD_DIR}" --parallel "${JOBS}" \
-    --target dnnl test_internals benchdnn
+    --target dnnl test_internals test_internals_env_vars_dnnl \
+    test_internals_env_vars_onednn benchdnn
 echo
 
 # --- Step 3: Run targeted AMX bf16 tests ---------------------------------------

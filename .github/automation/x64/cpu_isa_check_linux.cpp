@@ -37,6 +37,15 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+// AMX intrinsics (_tile_*) are available when the translation unit is compiled
+// with -mamx-tile -mamx-bf16. The runner script adds those flags. If AMX
+// intrinsics are unavailable, ONEDNN_AMX_PROBE_INTRINSICS is left undefined and
+// the probe falls back to a TILERELEASE-only raw-byte test.
+#if defined(__AMX_TILE__) && defined(__AMX_BF16__)
+#include <immintrin.h>
+#define ONEDNN_AMX_PROBE_INTRINSICS 1
+#endif
+
 namespace {
 
 struct cpuid_regs_t {
@@ -144,15 +153,35 @@ int amx_arch_prctl_handshake() {
     return 1;
 }
 
-// Guarded AMX execution probe. Attempts to execute a real tile instruction and
+// AMX tile configuration structure (palette 1): 64-byte layout for LDTILECFG.
+struct amx_tilecfg_t {
+    uint8_t palette_id;
+    uint8_t start_row;
+    uint8_t reserved[14];
+    uint16_t colsb[16];
+    uint8_t rows[16];
+};
+
+// Result of the staged AMX execution probe: identifies exactly how far the
+// tile pipeline got before faulting (if at all).
+enum class amx_probe_stage_t {
+    ok, // full ldtilecfg + tileloadd + tdpbf16ps executed
+    release_faulted, // even TILERELEASE (no config/data) raised #UD
+    ldtilecfg_faulted, // tile *configuration* raised #UD
+    tileload_dpbf16_faulted, // tile *data*/compute raised #UD
+    skipped_no_intrinsics, // built without AMX intrinsics; only TILERELEASE ran
+};
+
+// Guarded AMX execution probe. Attempts to execute tile instructions and
 // catches SIGILL (#UD) via sigsetjmp/siglongjmp.
-// Returns 1 = executed OK, 0 = raised an exception (e.g. #UD / illegal instr).
 sigjmp_buf g_jmp;
 void sigill_handler(int) {
     siglongjmp(g_jmp, 1);
 }
 
-int probe_amx_execution() {
+// Runs `fn` under a SIGILL guard. Returns true if it completed, false on #UD.
+template <typename F>
+bool run_guarded(F &&fn) {
     struct sigaction sa {};
     struct sigaction old {};
     sa.sa_handler = sigill_handler;
@@ -160,19 +189,77 @@ int probe_amx_execution() {
     sa.sa_flags = 0;
     sigaction(SIGILL, &sa, &old);
 
-    int result;
+    bool ok;
     if (sigsetjmp(g_jmp, 1) == 0) {
-        // TILERELEASE (encoded as bytes: C4 E2 78 49 C0) is a benign AMX tile
-        // instruction that resets tile state and needs no configuration. If AMX
-        // is genuinely usable this is a no-op; otherwise it raises #UD.
-        __asm__ __volatile__(".byte 0xC4, 0xE2, 0x78, 0x49, 0xC0" ::: "memory");
-        result = 1;
+        fn();
+        ok = true;
     } else {
-        result = 0;
+        ok = false;
     }
 
     sigaction(SIGILL, &old, nullptr);
-    return result;
+    return ok;
+}
+
+// TILERELEASE via raw bytes (C4 E2 78 49 C0): benign, needs no config/data.
+bool probe_tilerelease() {
+    return run_guarded([] {
+        __asm__ __volatile__(
+                ".byte 0xC4, 0xE2, 0x78, 0x49, 0xC0" ::: "memory");
+    });
+}
+
+// Staged AMX execution probe. Runs progressively heavier tile operations and
+// reports the first stage that faults, so a VM that enables config-level tile
+// ops but not XTILEDATA-backed data/compute ops is distinguished from one where
+// AMX is entirely unusable.
+amx_probe_stage_t probe_amx_execution() {
+    if (!probe_tilerelease()) return amx_probe_stage_t::release_faulted;
+
+#ifdef ONEDNN_AMX_PROBE_INTRINSICS
+    // Consistent palette-1 config: M=16, N=16, K=32 bf16. All tiles 16x64.
+    amx_tilecfg_t cfg;
+    std::memset(&cfg, 0, sizeof(cfg));
+    cfg.palette_id = 1;
+    for (int t = 0; t < 3; ++t) {
+        cfg.rows[t] = 16;
+        cfg.colsb[t] = 64;
+    }
+
+    // Level 2: LDTILECFG (tile *configuration* path).
+    const bool cfg_ok = run_guarded([&] {
+        _tile_loadconfig(&cfg);
+        _tile_release();
+    });
+    if (!cfg_ok) return amx_probe_stage_t::ldtilecfg_faulted;
+
+    // Level 3: full LDTILECFG + TILELOADD (tile *data*, needs XTILEDATA backed
+    // by OS/hypervisor) + TDPBF16PS (bf16 multiply, what oneDNN kernels run).
+    alignas(64) uint16_t a[16 * 32];
+    alignas(64) uint16_t b[16 * 32];
+    alignas(64) float c[16 * 16];
+    for (int i = 0; i < 16 * 32; ++i) {
+        a[i] = 0x3F80; // bf16(1.0)
+        b[i] = 0x3F80; // bf16(1.0)
+    }
+    std::memset(c, 0, sizeof(c));
+
+    const bool compute_ok = run_guarded([&] {
+        _tile_loadconfig(&cfg);
+        _tile_loadd(0, a, 64);
+        _tile_loadd(1, b, 64);
+        _tile_loadd(2, c, 64);
+        _tile_dpbf16ps(2, 0, 1);
+        _tile_stored(2, c, 64);
+        _tile_release();
+    });
+    if (!compute_ok) return amx_probe_stage_t::tileload_dpbf16_faulted;
+
+    return amx_probe_stage_t::ok;
+#else
+    // Built without AMX intrinsics: only the TILERELEASE stage was tested.
+    return amx_probe_stage_t::skipped_no_intrinsics;
+#endif
 }
 
 } // namespace
@@ -251,16 +338,34 @@ int main() {
     printf("oneDNN would enable AMX BF16          : %s\n", yn(amx_bf16_selected));
 
     // --- Guarded AMX execution probe ------------------------------------------
-    printf("\n-- AMX execution probe (guarded) ----------------------------------\n");
+    printf("\n-- AMX execution probe (guarded, staged) --------------------------\n");
     if (!amx_tile) {
         printf("AMX EXECUTION      : SKIPPED (AMX_TILE not advertised)\n");
     } else {
-        const int ok = probe_amx_execution();
-        if (ok) {
-            printf("AMX EXECUTION      : OK (tile instruction executed)\n");
-        } else {
-            printf("AMX EXECUTION      : FAULTED (#UD) - AMX advertised but not "
-                   "executable on this host\n");
+        const amx_probe_stage_t stage = probe_amx_execution();
+        switch (stage) {
+            case amx_probe_stage_t::ok:
+                printf("AMX EXECUTION      : OK (ldtilecfg + tileloadd + "
+                       "tdpbf16ps all executed)\n");
+                break;
+            case amx_probe_stage_t::release_faulted:
+                printf("AMX EXECUTION      : FAULTED (#UD) at TILERELEASE - no "
+                       "tile ops usable on this host\n");
+                break;
+            case amx_probe_stage_t::ldtilecfg_faulted:
+                printf("AMX EXECUTION      : FAULTED (#UD) at LDTILECFG - tile "
+                       "configuration not usable on this host\n");
+                break;
+            case amx_probe_stage_t::tileload_dpbf16_faulted:
+                printf("AMX EXECUTION      : FAULTED (#UD) at TILELOADD/TDPBF16PS "
+                       "- config OK but XTILEDATA-backed data/compute NOT usable "
+                       "(partial AMX enablement, e.g. under virtualization)\n");
+                break;
+            case amx_probe_stage_t::skipped_no_intrinsics:
+                printf("AMX EXECUTION      : PARTIAL (TILERELEASE OK; built "
+                       "without -mamx-tile/-mamx-bf16, data/compute path not "
+                       "tested)\n");
+                break;
         }
     }
 
