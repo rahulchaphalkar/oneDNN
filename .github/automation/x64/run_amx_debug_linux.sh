@@ -121,5 +121,5 @@ echo "------------------------------------------------------------------"
 echo " Step 3: Run targeted AMX bf16 tests (ONEDNN_VERBOSE=1)"
 echo "------------------------------------------------------------------"
 export ONEDNN_VERBOSE=1
-ctest --test-dir "${BUILD_DIR}" --output-on-failure \
+ctest --test-dir "${BUILD_DIR}" --verbose --output-on-failure \
     -R "test_internals|test_benchdnn_modeC_conv_smoke_cpu|test_benchdnn_modeC_matmul_smoke_cpu"
