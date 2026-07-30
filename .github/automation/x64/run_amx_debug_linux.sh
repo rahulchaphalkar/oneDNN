@@ -116,9 +116,24 @@ cmake --build "${BUILD_DIR}" --parallel "${JOBS}" \
     test_internals_env_vars_onednn benchdnn
 echo
 
-# --- Step 3: Run targeted AMX bf16 tests ---------------------------------------
+# --- Step 3: Isolate the first small-tail AMX BF16 BRGEMM case -----------------
 echo "------------------------------------------------------------------"
-echo " Step 3: Run targeted AMX bf16 tests (ONEDNN_VERBOSE=1)"
+echo " Step 3: Isolate AMX BF16 BRGEMM M=N=K=4 with TILECFG tracing"
+echo "------------------------------------------------------------------"
+set +e
+GTEST_FILTER="TestBRGEMMSimple/brgemm_test_t.TestsBRGEMM/54" \
+ONEDNN_TEST_BRGEMM_AMX_TRACE=1 \
+ONEDNN_VERBOSE=1 \
+ctest --test-dir "${BUILD_DIR}" --verbose --output-on-failure \
+    -R "^test_internals$"
+ISOLATED_STATUS=$?
+set -e
+echo "Isolated BRGEMM diagnostic exit code: ${ISOLATED_STATUS}"
+echo
+
+# --- Step 4: Run targeted AMX bf16 tests ---------------------------------------
+echo "------------------------------------------------------------------"
+echo " Step 4: Run targeted AMX bf16 tests (ONEDNN_VERBOSE=1)"
 echo "------------------------------------------------------------------"
 export ONEDNN_VERBOSE=1
 ctest --test-dir "${BUILD_DIR}" --verbose --output-on-failure \

@@ -92,6 +92,19 @@ jobs:
           cmake --build %CD%\build --parallel --target dnnl test_internals test_internals_env_vars_dnnl test_internals_env_vars_onednn benchdnn
           if errorlevel 1 exit /b 1
 
+      - name: Isolate AMX BF16 BRGEMM small-tail case
+        continue-on-error: true
+        working-directory: ${{ github.workspace }}/oneDNN
+        shell: cmd
+        env:
+          GTEST_FILTER: TestBRGEMMSimple/brgemm_test_t.TestsBRGEMM/54
+          ONEDNN_TEST_BRGEMM_AMX_TRACE: 1
+          ONEDNN_VERBOSE: 1
+        run: |
+          set "PATH=%LLVM_PATH%\bin;%CD%\build\src;%PATH%"
+          cd %CD%\build
+          ctest --verbose --output-on-failure -R "^test_internals$"
+
       - name: Run oneDNN tests
         working-directory: ${{ github.workspace }}/oneDNN
         shell: cmd

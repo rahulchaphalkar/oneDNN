@@ -165,10 +165,11 @@ struct amx_tilecfg_t {
 // Result of the staged AMX execution probe: identifies exactly how far the
 // tile pipeline got before faulting (if at all).
 enum class amx_probe_stage_t {
-    ok, // full ldtilecfg + tileloadd + tdpbf16ps executed
+    ok, // full-size and small-tail BF16 probes executed
     release_faulted, // even TILERELEASE (no config/data) raised #UD
     ldtilecfg_faulted, // tile *configuration* raised #UD
     tileload_dpbf16_faulted, // tile *data*/compute raised #UD
+    small_bf16_faulted, // valid M=N=K=4 BF16 tile geometry raised #UD
     skipped_no_intrinsics, // built without AMX intrinsics; only TILERELEASE ran
 };
 
@@ -254,6 +255,28 @@ amx_probe_stage_t probe_amx_execution() {
         _tile_release();
     });
     if (!compute_ok) return amx_probe_stage_t::tileload_dpbf16_faulted;
+
+    // Repeat with the exact small geometry that starts the failing oneDNN
+    // BRGEMM case /54: M=4, N=4, K=4.
+    amx_tilecfg_t small_cfg;
+    std::memset(&small_cfg, 0, sizeof(small_cfg));
+    small_cfg.palette_id = 1;
+    small_cfg.rows[0] = 4;
+    small_cfg.colsb[0] = 8; // A: K*2
+    small_cfg.rows[1] = 2;
+    small_cfg.colsb[1] = 16; // B: K/2 rows, N*4 bytes
+    small_cfg.rows[2] = 4;
+    small_cfg.colsb[2] = 16; // C: M rows, N*4 bytes
+    const bool small_ok = run_guarded([&] {
+        _tile_loadconfig(&small_cfg);
+        _tile_loadd(0, a, 64);
+        _tile_loadd(1, b, 64);
+        _tile_loadd(2, c, 64);
+        _tile_dpbf16ps(2, 0, 1);
+        _tile_stored(2, c, 64);
+        _tile_release();
+    });
+    if (!small_ok) return amx_probe_stage_t::small_bf16_faulted;
 
     return amx_probe_stage_t::ok;
 #else
@@ -345,8 +368,8 @@ int main() {
         const amx_probe_stage_t stage = probe_amx_execution();
         switch (stage) {
             case amx_probe_stage_t::ok:
-                printf("AMX EXECUTION      : OK (ldtilecfg + tileloadd + "
-                       "tdpbf16ps all executed)\n");
+                  printf("AMX EXECUTION      : OK (full M=16,N=16,K=32 and "
+                      "small M=N=K=4 BF16 tile paths executed)\n");
                 break;
             case amx_probe_stage_t::release_faulted:
                 printf("AMX EXECUTION      : FAULTED (#UD) at TILERELEASE - no "
@@ -360,6 +383,10 @@ int main() {
                 printf("AMX EXECUTION      : FAULTED (#UD) at TILELOADD/TDPBF16PS "
                        "- config OK but XTILEDATA-backed data/compute NOT usable "
                        "(partial AMX enablement, e.g. under virtualization)\n");
+                break;
+            case amx_probe_stage_t::small_bf16_faulted:
+                printf("AMX EXECUTION      : FAULTED (#UD) in valid small "
+                       "M=N=K=4 TDPBF16PS path (full-tile path passed)\n");
                 break;
             case amx_probe_stage_t::skipped_no_intrinsics:
                 printf("AMX EXECUTION      : PARTIAL (TILERELEASE OK; built "

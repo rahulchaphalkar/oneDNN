@@ -14,6 +14,9 @@
 * limitations under the License.
 *******************************************************************************/
 
+#include <cstdio>
+#include <cstdlib>
+
 #include "test_gemm_data_preparation.hpp"
 #include "test_gemm_params.hpp"
 #include "test_gemm_validation.hpp"
@@ -39,6 +42,70 @@ struct brgemm_params_t : test_params_t {
 
     int bs;
 };
+
+namespace {
+
+bool brgemm_amx_trace_enabled() {
+    const char *value = std::getenv("ONEDNN_TEST_BRGEMM_AMX_TRACE");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+const char *data_type_name(impl::data_type_t dt) {
+    using namespace impl::data_type;
+    switch (dt) {
+        case f32: return "f32";
+        case bf16: return "bf16";
+        case f16: return "f16";
+        case s8: return "s8";
+        case u8: return "u8";
+        default: return "other";
+    }
+}
+
+void trace_brgemm_amx(const char *stage, const brgemm_params_t &p,
+        const impl::cpu::x64::brgemm_desc_t &desc,
+        const char *palette = nullptr) {
+    if (!brgemm_amx_trace_enabled()) return;
+
+    std::fprintf(stderr,
+            "[BRGEMM_AMX_TRACE] stage=%s M=%lld N=%lld K=%lld "
+            "lda=%lld ldb=%lld ldc=%lld dt=%s:%s alpha=%g beta=%g "
+            "isa=%s is_tmm=%d blocks={bd:%d tail:%d,ld:%d tail:%d,rd:%d "
+            "tail:%d step:%d}\n",
+            stage, static_cast<long long>(p.M), static_cast<long long>(p.N),
+            static_cast<long long>(p.K), static_cast<long long>(p.lda),
+            static_cast<long long>(p.ldb), static_cast<long long>(p.ldc),
+            data_type_name(p.dt_a), data_type_name(p.dt_b), p.alpha, p.beta,
+            impl::cpu::x64::isa2str(desc.isa_impl).c_str(), desc.is_tmm ? 1 : 0,
+            desc.bd_block, desc.bdb_tail, desc.ld_block, desc.ldb_tail,
+            desc.rd_block, desc.rdb_tail, desc.rd_step);
+
+    if (palette != nullptr) {
+        const auto *cfg
+                = reinterpret_cast<const impl::cpu::x64::palette_config_t *>(
+                        palette);
+        std::fprintf(stderr,
+                "[BRGEMM_AMX_TRACE] tilecfg palette=%u start_row=%u\n",
+                static_cast<unsigned>(cfg->palette_id),
+                static_cast<unsigned>(cfg->startRow));
+        for (int tile = 0; tile < impl::cpu::x64::palette_config_t::max_size;
+                ++tile) {
+            if (cfg->rows[tile] == 0 && cfg->cols[tile] == 0) continue;
+            std::fprintf(stderr,
+                    "[BRGEMM_AMX_TRACE] tile=%d rows=%u colsb=%u\n", tile,
+                    static_cast<unsigned>(cfg->rows[tile]),
+                    static_cast<unsigned>(cfg->cols[tile]));
+        }
+        std::fprintf(stderr, "[BRGEMM_AMX_TRACE] tilecfg_raw=");
+        for (int i = 0; i < 64; ++i)
+            std::fprintf(stderr, "%02X",
+                    static_cast<unsigned char>(palette[i]));
+        std::fprintf(stderr, "\n");
+    }
+    std::fflush(stderr);
+}
+
+} // namespace
 
 class params_creator_t {
 public:
@@ -204,11 +271,13 @@ private:
         if (desc.is_tmm) {
             res = brgemm_init_tiles(desc, palette);
             if (res != dnnl_success) return res;
+            trace_brgemm_amx("palette-ready", p, desc, palette);
         }
 
         x64::brgemm_kernel_t *_t_ptr;
         res = brgemm_kernel_create(&_t_ptr, desc);
         if (res != dnnl_success) return res;
+        if (desc.is_tmm) trace_brgemm_amx("kernel-created", p, desc, palette);
 
         x64::brgemm_batch_element_t batch_element;
         batch_element.ptr.A = A;
@@ -216,18 +285,24 @@ private:
         batch_element.vvpad.top = 0;
         batch_element.vvpad.bottom = 0;
         if (desc.is_tmm) {
+            trace_brgemm_amx("before-ldtilecfg", p, desc, palette);
             res = amx_tile_configure(palette);
             if (res != dnnl_success) return res;
+            trace_brgemm_amx("after-ldtilecfg", p, desc, palette);
         }
+        if (desc.is_tmm) trace_brgemm_amx("before-kernel", p, desc, palette);
         brgemm_kernel_execute(_t_ptr, p.bs, &batch_element, C,
                 desc.is_tmm ? tile_buffer : nullptr);
+        if (desc.is_tmm) trace_brgemm_amx("after-kernel", p, desc, palette);
 
         res = brgemm_kernel_destroy(_t_ptr);
         if (res != dnnl_success) return res;
 
         if (desc.is_tmm) {
+            trace_brgemm_amx("before-tilerelease", p, desc, palette);
             res = amx_tile_release();
             if (res != dnnl_success) return res;
+            trace_brgemm_amx("after-tilerelease", p, desc, palette);
         }
 
         return res;
